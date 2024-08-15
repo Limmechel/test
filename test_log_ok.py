@@ -7,33 +7,37 @@ from urllib3.util import Retry
 import httpx
 from httpx import DigestAuth, Limits
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from collections import defaultdict
 
 class PoolManager:
-    def __init__(self, username, passwords):
+    def __init__(self, username, passwords, max_concurrent=20, timeout=10):
         self.username = username
         self.passwords = passwords
+        self.timeout = timeout
+        self.logger = logging.getLogger(__name__)
 
         # Настройка клиента с лимитами на количество соединений
         limits = Limits(max_connections=100, max_keepalive_connections=20)
         self.session = httpx.Client(limits=limits)
         self.session.headers.update({'Connection': 'keep-alive'})
-        self.cached_auth = None
+        self.async_client = httpx.AsyncClient(limits=limits)
+        
+        self.cached_auth = defaultdict(lambda: None)
+        self.semaphore = asyncio.Semaphore(max_concurrent)
 
     def get_auth(self, ip):
-        if self.cached_auth:
-            return self.cached_auth
+        if self.cached_auth[ip]:
+            return self.cached_auth[ip]
 
         for pwd in self.passwords:
-            auth = httpx.DigestAuth(self.username, pwd)
+            auth = DigestAuth(self.username, pwd)
             try:
-                # Пробуем авторизацию без таймаута
-                response = self.session.get(f'http://{ip}/cgi-bin/get_system_info.cgi', auth=auth)
+                response = self.session.get(f'http://{ip}/cgi-bin/get_system_info.cgi', auth=auth, timeout=self.timeout)
                 if response.status_code == 200:
-                    self.cached_auth = auth
+                    self.cached_auth[ip] = auth
                     return auth
             except httpx.RequestError:
-                continue  # Неправильный пароль, пробуем следующий
+                continue
 
         return None
 
@@ -58,15 +62,20 @@ class PoolManager:
         if not auth:
             return False, f"Ошибка аутентификации для {ip} со всеми паролями"
 
-        try:
-            async with httpx.AsyncClient(auth=auth, limits=Limits(max_connections=100, max_keepalive_connections=20)) as client:
-                response = await client.post(url, json=data, headers=headers)
-                if response.status_code == 200:
-                    return True, f"Пулы успешно применены для {ip}"
-                else:
-                    return False, f"Ошибка при применении пулов для {ip}. Код ответа: {response.status_code}"
-        except httpx.RequestError as e:
-            return False, f"Error applying pools for {ip}: {str(e)}"
+        async with self.semaphore:
+            try:
+                response = await self.async_client.post(url, json=data, headers=headers, auth=auth, timeout=self.timeout)
+                response.raise_for_status()
+                return True, f"Пулы успешно применены для {ip}"
+            except httpx.HTTPStatusError as e:
+                self.logger.error(f"HTTP error for {ip}: {e}")
+                return False, f"HTTP error for {ip}: {e}"
+            except httpx.RequestError as e:
+                self.logger.error(f"Request error for {ip}: {e}")
+                return False, f"Request error for {ip}: {e}"
+            except Exception as e:
+                self.logger.exception(f"Unexpected error for {ip}: {e}")
+                return False, f"Unexpected error for {ip}: {e}"
 
     async def apply_pools_batch_async(self, ips, pools, batch_size=10):
         tasks = []
@@ -108,15 +117,20 @@ class PoolManager:
         if not auth:
             return ip, False, f"Ошибка аутентификации для {ip} со всеми паролями"
 
-        try:
-            async with httpx.AsyncClient(auth=auth, limits=Limits(max_connections=100, max_keepalive_connections=20)) as client:
-                response = await client.post(url, json=settings, headers=headers)
-                if response.status_code == 200:
-                    return ip, True, f"Настройки отправлены для {ip}"
-                else:
-                    return ip, False, f"Ошибка при отправке настроек для {ip}: {response.status_code}"
-        except httpx.RequestError as e:
-            return ip, False, f"Ошибка при отправке настроек для {ip}: {str(e)}"
+        async with self.semaphore:
+            try:
+                response = await self.async_client.post(url, json=settings, headers=headers, auth=auth, timeout=self.timeout)
+                response.raise_for_status()
+                return ip, True, f"Настройки отправлены для {ip}"
+            except httpx.HTTPStatusError as e:
+                self.logger.error(f"HTTP error for {ip}: {e}")
+                return ip, False, f"HTTP error for {ip}: {e}"
+            except httpx.RequestError as e:
+                self.logger.error(f"Request error for {ip}: {e}")
+                return ip, False, f"Request error for {ip}: {e}"
+            except Exception as e:
+                self.logger.exception(f"Unexpected error for {ip}: {e}")
+                return ip, False, f"Unexpected error for {ip}: {e}"
 
     async def set_miner_conf_batch_async(self, ips, settings, batch_size=5):
         tasks = []
@@ -137,6 +151,10 @@ class PoolManager:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(self.set_miner_conf_batch_async(ips, settings, batch_size))
+
+    async def close(self):
+        await self.async_client.aclose()
+        self.session.close()
 import json
 import requests
 import ipaddress
@@ -186,33 +204,26 @@ def exception_handler(exc_type, exc_value, exc_traceback):
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
     
 def check_api(ip, port=4028, timeout=1):
-    start_time = time.time()  # Начало замера времени
-  #  print(f"Checking {ip}...")
-
+    start_time = time.time()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
         sock.connect((ip, port))
         sock.send(json.dumps({"command": "version"}).encode())
-        response = sock.recv(4096)  # Увеличьте размер буфера
+        response = sock.recv(4096)
         response = response.strip(b'\x00')
         try:
             json.loads(response)
             return True
         except json.JSONDecodeError:
             return False
-    except socket.timeout:
-        return False
-    except ConnectionRefusedError:
-        return False
-    except Exception as e:
+    except (socket.timeout, ConnectionRefusedError, Exception):
         return False
     finally:
         sock.close()
-        end_time = time.time()  # Конец замера времени
+        end_time = time.time()
         elapsed_time = end_time - start_time
-      #  print(f"Execution time for {ip}: {elapsed_time:.4f} seconds")
-        
+
 def ip_range_to_list(ip_ranges):
     all_ips = set()
     for ip_range in ip_ranges.split(','):
@@ -227,81 +238,40 @@ def ip_range_to_list(ip_ranges):
                 print(f"Invalid IP address in range {ip_range}: {e}")
         else:
             try:
-                ipaddress.IPv4Address(ip_range)  # Validate single IP
+                ipaddress.IPv4Address(ip_range)
                 all_ips.add(ip_range)
             except ipaddress.AddressValueError as e:
                 print(f"Invalid IP address: {ip_range}: {e}")
     return list(all_ips)
 
-# Функция для получения данных с /cgi-bin/stats.cgi
 def get_stats(ip):
-    data = {}   
-    # Получение данных pools
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)  # Увеличиваем таймаут до 10 секунд
-        sock.connect((ip, 4028))
-        
+    data = {}
+    
+    def get_data(command):
         try:
-            sock.send(json.dumps({"command": "pools"}).encode())
-            pools_response = sock.recv(4096).decode('utf-8')
-            pools_response = pools_response.strip('\x00')
-            try:
-                pools_data = json.loads(pools_response)
-                data["pools"] = pools_data["POOLS"]  # Сохраняем только значение ключа "POOLS"
-             #   print(f"Received pools data from {ip}: {pools_data}")  # Добавленный вывод
-            except json.JSONDecodeError:
-            #    print(f"Failed to parse pools data from {ip}")  # Добавленный вывод
-                pass
-        except (socket.timeout, socket.error):
-         #   print(f"Failed to receive pools data from {ip}")  # Добавленный вывод
-            pass
-    except (socket.timeout, socket.error, ConnectionRefusedError) as e:
-        print(f"Error getting pools from {ip}: {str(e)}")
-    finally:
-        sock.close()  # Закрываем соединение после получения данных pools
-    
-    # Получение данных stats
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)  # Увеличиваем таймаут до 10 секунд
-        sock.connect((ip, 4028))
-        
-        try:
-           # print(f"Sending stats command to {ip}")  # Добавленный вывод
-            sock.send(json.dumps({"command": "stats"}).encode())
-           # print(f"Sent stats command to {ip}")  # Добавленный вывод
-            
-            stats_response = sock.recv(4096).decode('utf-8')
-         #   print(f"Received stats response from {ip}: {stats_response}")  # Добавленный вывод
-            
-            stats_response = stats_response.strip('\x00')
-         #   print(f"Stripped stats response from {ip}: {stats_response}")  # Добавленный вывод
-            
-            try:
-                stats_data = json.loads(stats_response)
-             #   print(f"Parsed stats data from {ip}: {stats_data}")  # Добавленный вывод
-                data["stats"] = stats_data
-            except json.JSONDecodeError:
-            #    print(f"Failed to parse stats data from {ip}")  # Добавленный вывод
-                data["stats"] = {}  # Устанавливаем пустой словарь, если не удалось распарсить данные статистики
-        except (socket.timeout, socket.error):
-         #   print(f"Failed to receive stats data from {ip}")  # Добавленный вывод
-            data["stats"] = {}  # Устанавливаем пустой словарь, если не удалось получить данные статистики
-    except (socket.timeout, socket.error, ConnectionRefusedError) as e:
-        print(f"Error getting stats from {ip}: {str(e)}")
-    finally:
-        sock.close()  # Закрываем соединение после получения данных stats
-    
-    if not data:
-      #  print(f"No data received from {ip}")  # Добавленный вывод
-        return None
-    
-    return data
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(10)
+                sock.connect((ip, 4028))
+                sock.send(json.dumps({"command": command}).encode())
+                response = sock.recv(4096).decode('utf-8').strip('\x00')
+                return json.loads(response)
+        except (socket.timeout, socket.error, json.JSONDecodeError, ConnectionRefusedError):
+            return {}
 
-# Функция для получения текущего конфигурационного файла
+    pools_data = get_data("pools")
+    if "POOLS" in pools_data:
+        data["pools"] = pools_data["POOLS"]
+
+    stats_data = get_data("stats")
+    if stats_data:
+        data["stats"] = stats_data
+
+    return data if data else None
+
 def get_config(ip):
-    url = f"http://{ip}/cgi-bin/get_miner_conf.cgi"    
+    global username, password
+    url = f"http://{ip}/cgi-bin/get_miner_conf.cgi"
+    
     def try_password(pwd):
         try:
             response = requests.get(url, auth=HTTPDigestAuth(username, pwd), 
@@ -312,20 +282,19 @@ def get_config(ip):
         except requests.RequestException:
             pass
         return None, pwd
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_pwd = {executor.submit(try_password, pwd): pwd for pwd in password}
         for future in as_completed(future_to_pwd):
-            result, pwd = future.result()
+            result, _ = future.result()
             if result:
-               # print(f"Received config from {ip} with password: {pwd}")
                 return result
-        #    else:
-              #  print(f"Failed to get config from {ip} with password: {pwd}")
- #   print(f"Failed to get config from {ip} with any password")
     return None
-        
+
 def get_power(ip):
+    global username, password
     url = f"http://{ip}/cgi-bin/get_system_info.cgi"
+    
     def try_password(pwd):
         try:
             response = requests.get(url, auth=HTTPDigestAuth(username, pwd),
@@ -337,16 +306,13 @@ def get_power(ip):
         except requests.RequestException:
             pass
         return None, pwd
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_pwd = {executor.submit(try_password, pwd): pwd for pwd in password}
         for future in as_completed(future_to_pwd):
-            power, pwd = future.result()
+            power, _ = future.result()
             if power is not None:
-               # print(f"Received power info from {ip} with password: {pwd}")
                 return power
-          #  else:
-              #  print(f"Failed to get power info from {ip} with password: {pwd}")
- #   print(f"Failed to get power info from {ip} with any password")
     return None
 
 # Логин и пароль для авторизации
@@ -1879,69 +1845,11 @@ class MainWindow(BaseMainWindow):
         for item in data:
             ip, stats, config = item
             if stats is None:
-                # Удаление IP из таблицы, если связь потеряна
-                for row in range(self.table.rowCount()):
-                    cell_item = self.table.item(row, 0)
-                    if cell_item is not None and cell_item.text() == ip:
-                        self.table.removeRow(row)
-                        break
+                self.remove_ip_from_table(ip)
                 continue
 
-            stats_data = stats.get("stats", {}).get("STATS", [{}])[1] if len(stats.get("stats", {}).get("STATS", [])) > 1 else {}
-
-            miner_type = stats.get("stats", {}).get("STATS", [{}])[0].get("Type", "")
-            compile_time = stats.get("stats", {}).get("STATS", [{}])[0].get("CompileTime", "")
-            if "AoS" in compile_time:
-                miner_type += " [AoS]"
-
-            fan_speeds = [stats_data.get("fan1", 0), stats_data.get("fan2", 0), stats_data.get("fan3", 0), stats_data.get("fan4", 0)]
-            fan_speeds_str = f"{fan_speeds[0]}/{fan_speeds[1]}\n{fan_speeds[2]}/{fan_speeds[3]}" if len(fan_speeds) >= 4 else ""
-
-            elapsed_seconds = stats_data.get("Elapsed", 0)
-            elapsed_days = elapsed_seconds // 86400
-            elapsed_hours = (elapsed_seconds % 86400) // 3600
-            elapsed_minutes = (elapsed_seconds % 3600) // 60
-            elapsed_str = f"{elapsed_days}d {elapsed_hours}h {elapsed_minutes}m"
-
-            max_temp_chips = [stats_data.get("temp2_1", 0), stats_data.get("temp2_2", 0), stats_data.get("temp2_3", 0)]
-            max_temp_chips_str = '/'.join(map(str, max_temp_chips))
-
-            hashrate_5s = stats_data.get("GHS 5s", 0)
-            hashrate_avg = stats_data.get("GHS av", 0)
-
-            power_value = get_power(ip)
-            pools_data = stats.get("pools", [])
-
-            profile = ""
-            is_stock_mode = False
-            config = get_config(ip)
-            if config:
-                if config.get("bitmain-mode-level") == "0":
-                    profile = "Stock Mode"
-                    is_stock_mode = True
-                elif config.get("bitmain-mode-level") == "1":
-                    profile = config.get("bitmain-freq-prof", "")
-                elif config.get("bitmain-different-freq"):
-                    profile = f'{config.get("bitmain-freq-chain", "")}\n{config.get("bitmain-volt-chain", "")}'
-                else:
-                    profile = f'{config.get("bitmain-freq-chain0", "")}/{config.get("bitmain-freq-chain1", "")}/{config.get("bitmain-freq-chain2", "")}\n{config.get("bitmain-volt-chain", "")}'
-            else:
-                profile = ""
-
-            # Проверяем, есть ли уже такой IP в таблице
-            row_position = None
-            for row in range(self.table.rowCount()):
-                cell_item = self.table.item(row, 0)
-                if cell_item is not None and cell_item.text() == ip:
-                    row_position = row
-                    break
-
-            # Если IP не найден, добавляем новую строку
-            if row_position is None:
-                row_position = self.table.rowCount()
-                self.table.insertRow(row_position)
-
-            self.update_row(row_position, ip, profile, power_value, max_temp_chips_str, max_temp_chips, fan_speeds_str, elapsed_str, elapsed_seconds, miner_type, pools_data, is_stock_mode, config, hashrate_5s, hashrate_avg)
+            row_position = self.find_or_create_row(ip)
+            self.update_row(row_position, ip, stats, config)
 
         self.restore_column_widths()
         self.auto_resize_columns()
@@ -1950,70 +1858,108 @@ class MainWindow(BaseMainWindow):
         self.update_selected_settings_button_state()
         self.table.resizeRowsToContents()
 
-    def update_row(self, row, ip, profile, power_value, max_temp_chips_str, max_temp_chips, fan_speeds_str,     elapsed_str, elapsed_seconds, miner_type, pools_data, is_stock_mode, config, hashrate_5s, hashrate_avg):
-    
-        self.table.setItem(row, 0, QTableWidgetItem(ip))
+    def remove_ip_from_table(self, ip):
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0) and self.table.item(row, 0).text() == ip:
+                self.table.removeRow(row)
+                break
 
-        item_profile = QTableWidgetItem(profile)
-        item_profile.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(row, 1, item_profile)
+    def find_or_create_row(self, ip):
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0) and self.table.item(row, 0).text() == ip:
+                return row
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        return row
 
-        item_power = QTableWidgetItem(power_value)
-        item_power.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-        item_power.setData(Qt.DisplayRole, float(power_value) if power_value else 0)
-        self.table.setItem(row, 2, item_power)
+    def update_row(self, row, ip, stats, config):
+        stats_data = stats.get("stats", {}).get("STATS", [{}])[1] if len(stats.get("stats", {}).get("STATS", [])) > 1 else {}
+        miner_type = self.get_miner_type(stats)
+        fan_speeds_str = self.get_fan_speeds_str(stats_data)
+        elapsed_str, elapsed_seconds = self.get_elapsed_time(stats_data)
+        max_temp_chips_str, max_temp_chips = self.get_max_temp_chips(stats_data)
+        hashrate_5s = stats_data.get("GHS 5s", 0)
+        hashrate_avg = stats_data.get("GHS av", 0)
+        power_value = get_power(ip)
+        pools_data = stats.get("pools", [])
+        profile, is_stock_mode = self.get_profile(config)
 
-        # Объединение модели асика и информации о наличии "AoS"
-        self.table.setItem(row, 3, QTableWidgetItem(miner_type))
-        
-        item_rate_5s = QTableWidgetItem()
-        item_rate_5s.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-        # Преобразуем Gh/s в Th/s и округляем до целого числа
-        rate_5s_th = round(hashrate_5s / 1000)
-        display_value = f"{rate_5s_th} Th/s"
-        item_rate_5s.setText(display_value)
-        item_rate_5s.setData(Qt.UserRole, hashrate_5s)  # Сохраняем оригинальное значение для сортировки
-        self.table.setItem(row, 4, item_rate_5s)
+        self.set_table_item(row, 0, ip, alignment=Qt.AlignCenter)
+        self.set_table_item(row, 1, profile, alignment=Qt.AlignCenter)
+        self.set_table_item(row, 2, power_value, alignment=Qt.AlignCenter | Qt.AlignVCenter, data_role=float(power_value) if power_value else 0)
+        self.set_table_item(row, 3, miner_type, alignment=Qt.AlignCenter)
+        self.set_hashrate_item(row, 4, hashrate_5s, "5s")
+        self.set_hashrate_item(row, 5, hashrate_avg, "avg")
+        self.set_table_item(row, 6, max_temp_chips_str, alignment=Qt.AlignCenter | Qt.AlignVCenter, user_role=max(max_temp_chips) if max_temp_chips else 0)
+        self.set_temp_fans_item(row, 7, is_stock_mode, fan_speeds_str, config)
+        self.set_table_item(row, 8, elapsed_str, alignment=Qt.AlignCenter | Qt.AlignVCenter, user_role=elapsed_seconds)
+        self.set_pool_info(row, 9, 10, pools_data, alignment=Qt.AlignCenter)
 
-        item_rate_avg = QTableWidgetItem()
-        item_rate_avg.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-        # Преобразуем Gh/s в Th/s и округляем до целого числа
-        rate_avg_th = round(hashrate_avg / 1000)
-        display_value_avg = f"{rate_avg_th} Th/s"
-        item_rate_avg.setText(display_value_avg)
-        item_rate_avg.setData(Qt.UserRole, hashrate_avg)  # Сохраняем оригинальное значение для сортировки
-        self.table.setItem(row, 5, item_rate_avg)
+    def get_miner_type(self, stats):
+        miner_type = stats.get("stats", {}).get("STATS", [{}])[0].get("Type", "")
+        compile_time = stats.get("stats", {}).get("STATS", [{}])[0].get("CompileTime", "")
+        return f"{miner_type} [AoS]" if "AoS" in compile_time else miner_type
 
-        item_max_temp_chips = QTableWidgetItem(max_temp_chips_str)
-        item_max_temp_chips.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-        item_max_temp_chips.setData(Qt.UserRole, max(max_temp_chips) if max_temp_chips else 0)
-        self.table.setItem(row, 6, item_max_temp_chips)
+    def get_fan_speeds_str(self, stats_data):
+        fan_speeds = [stats_data.get(f"fan{i}", 0) for i in range(1, 5)]
+        return f"{fan_speeds[0]}/{fan_speeds[1]}\n{fan_speeds[2]}/{fan_speeds[3]}" if len(fan_speeds) >= 4 else ""
 
+    def get_elapsed_time(self, stats_data):
+        elapsed_seconds = stats_data.get("Elapsed", 0)
+        elapsed_days, remainder = divmod(elapsed_seconds, 86400)
+        elapsed_hours, remainder = divmod(remainder, 3600)
+        elapsed_minutes = remainder // 60
+        return f"{elapsed_days}d {elapsed_hours}h {elapsed_minutes}m", elapsed_seconds
+
+    def get_max_temp_chips(self, stats_data):
+        max_temp_chips = [stats_data.get(f"temp2_{i}", 0) for i in range(1, 4)]
+        return '/'.join(map(str, max_temp_chips)), max_temp_chips
+
+    def get_profile(self, config):
+        if not config:
+            return "", False
+        if config.get("bitmain-mode-level") == "0":
+            return "Stock Mode", True
+        elif config.get("bitmain-mode-level") == "1":
+            return config.get("bitmain-freq-prof", ""), False
+        elif config.get("bitmain-different-freq"):
+            return f'{config.get("bitmain-freq-chain", "")}\n{config.get("bitmain-volt-chain", "")}', False
+        else:
+            return f'{config.get("bitmain-freq-chain0", "")}/{config.get("bitmain-freq-chain1", "")}/{config.get("bitmain-freq-chain2", "")}\n{config.get("bitmain-volt-chain", "")}', False
+
+    def set_table_item(self, row, column, text, alignment=Qt.AlignLeft, data_role=None, user_role=None):
+        item = QTableWidgetItem(str(text))
+        item.setTextAlignment(alignment)
+        if data_role is not None:
+            item.setData(Qt.DisplayRole, data_role)
+        if user_role is not None:
+            item.setData(Qt.UserRole, user_role)
+        self.table.setItem(row, column, item)
+
+    def set_hashrate_item(self, row, column, hashrate, rate_type):
+        rate_th = round(hashrate / 1000)
+        display_value = f"{rate_th} Th/s"
+        self.set_table_item(row, column, display_value, alignment=Qt.AlignCenter | Qt.AlignVCenter, user_role=hashrate)
+
+    def set_temp_fans_item(self, row, column, is_stock_mode, fan_speeds_str, config):
         target_temp = config.get("bitmain-temp-target", "") if config else ""
         if is_stock_mode:
             combined_temp_fans = fan_speeds_str
         else:
-            if target_temp:
-                target_temp += "°C"
+            target_temp = f"{target_temp}°C" if target_temp else ""
             combined_temp_fans = f"{target_temp} | {fan_speeds_str}"
-        item_combined_temp_fans = QTableWidgetItem(combined_temp_fans)
-        item_combined_temp_fans.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(row, 7, item_combined_temp_fans)
+        self.set_table_item(row, column, combined_temp_fans, alignment=Qt.AlignRight | Qt.AlignVCenter)
 
-        elapsed_str_item = QTableWidgetItem(elapsed_str)
-        elapsed_str_item.setTextAlignment(Qt.AlignCenter | Qt.AlignVCenter)
-        elapsed_str_item.setData(Qt.UserRole, elapsed_seconds)  # Сохраняем секунды для сортировки
-        self.table.setItem(row, 8, elapsed_str_item)
-
-        pool_url = ""
-        worker_user = ""
-        if pools_data and isinstance(pools_data, list) and len(pools_data) > 0:
+    def set_pool_info(self, row, url_column, worker_column, pools_data, alignment=Qt.AlignCenter):
+        if pools_data and isinstance(pools_data, list) and pools_data:
             pool_data = pools_data[0]
-            pool_url = pool_data.get("URL", "")
-            pool_url = pool_url.replace("stratum+tcp://", "").replace("stratum+ssl://", "")
+            pool_url = pool_data.get("URL", "").replace("stratum+tcp://", "").replace("stratum+ssl://", "")
             worker_user = pool_data.get("User", "")
-        self.table.setItem(row, 9, QTableWidgetItem(pool_url))
-        self.table.setItem(row, 10, QTableWidgetItem(worker_user))
+            self.set_table_item(row, url_column, pool_url, alignment)
+            self.set_table_item(row, worker_column, worker_user, alignment)
+        else:
+            self.set_table_item(row, url_column, "", alignment)
+            self.set_table_item(row, worker_column, "", alignment)
         
     def adjust_column_widths(self):
         total_width = self.table.viewport().width()
